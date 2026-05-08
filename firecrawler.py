@@ -1,4 +1,4 @@
-import argparse, random, requests, signal, sys, time, threading, urllib3
+import argparse, random, requests, signal, sys, threading, urllib3
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 urllib3.disable_warnings()
@@ -7,6 +7,8 @@ _stop_event = threading.Event()
 
 MIN_SLEEP = 15
 MAX_SLEEP = 30
+REQUEST_TIMEOUT = 60
+MAX_POLL_RETRIES = 5
 
 def build_headers(api_key=None):
     headers = {"Content-Type": "application/json"}
@@ -16,7 +18,11 @@ def build_headers(api_key=None):
 
 def cancel_crawl_job(base_url, job_id, api_key=None, verbose=False):
     try:
-        requests.delete(f"{base_url}/v1/crawl/{job_id}", headers=build_headers(api_key))
+        requests.delete(
+            f"{base_url}/v1/crawl/{job_id}",
+            headers=build_headers(api_key),
+            timeout=REQUEST_TIMEOUT,
+        )
         if verbose:
             print(f"[INFO] Crawl job cancelled: {job_id}")
     except Exception as e:
@@ -26,7 +32,9 @@ def cancel_crawl_job(base_url, job_id, api_key=None, verbose=False):
 def map_firecrawl(base_url, url, api_key=None, verbose=False):
     headers = build_headers(api_key)
     payload = {"url": url, "includeSubdomains": True, "limit": 100000}
-    response = requests.post(f"{base_url}/v1/map", headers=headers, json=payload)
+    response = requests.post(
+        f"{base_url}/v1/map", headers=headers, json=payload, timeout=REQUEST_TIMEOUT
+    )
     response.raise_for_status()
     links = response.json().get("links", [])
     if verbose:
@@ -71,14 +79,15 @@ def crawl_firecrawl(base_url, url, api_key=None, verbose=False,
         }
     }
 
-    response = requests.post(f"{base_url}/v1/crawl", headers=headers, json=payload)
+    response = requests.post(
+        f"{base_url}/v1/crawl", headers=headers, json=payload, timeout=REQUEST_TIMEOUT
+    )
     response.raise_for_status()
     data = response.json()
 
     job_id = data.get("id")
     if not job_id:
-        if verbose:
-            print(f"[ERROR] No job ID returned: {data}")
+        print(f"[ERROR] No job ID returned for {url}: {data}")
         return
 
     if verbose:
@@ -93,12 +102,24 @@ def poll_crawl_job(base_url, job_id, api_key=None, verbose=False,
     headers = build_headers(api_key)
     completed_normally = False
     effective_lock = file_lock or threading.Lock()
+    consecutive_errors = 0
 
     try:
         while not _stop_event.is_set():
-            response = requests.get(status_url, headers=headers)
-            response.raise_for_status()
-            data = response.json()
+            try:
+                response = requests.get(status_url, headers=headers, timeout=REQUEST_TIMEOUT)
+                response.raise_for_status()
+                data = response.json()
+                consecutive_errors = 0
+            except Exception as e:
+                consecutive_errors += 1
+                if consecutive_errors >= MAX_POLL_RETRIES:
+                    print(f"[ERROR] Polling job {job_id} failed {consecutive_errors} times consecutively, giving up: {e}")
+                    return
+                print(f"[WARN] Polling job {job_id} failed (attempt {consecutive_errors}/{MAX_POLL_RETRIES}): {e}. Retrying...")
+                _stop_event.wait(random.randint(MIN_SLEEP, MAX_SLEEP))
+                continue
+
             status = data.get("status")
 
             if verbose:
@@ -116,16 +137,20 @@ def poll_crawl_job(base_url, job_id, api_key=None, verbose=False,
             if status == "completed":
                 completed_normally = True
                 next_url = data.get("next")
-                while next_url:
-                    resp = requests.get(next_url, headers=headers)
-                    resp.raise_for_status()
-                    page = resp.json()
-                    if output_file is not None and written_set is not None:
-                        flush_new_urls(
-                            extract_urls_from_results(page.get("data", [])),
-                            written_set, output_file, effective_lock, verbose
-                        )
-                    next_url = page.get("next")
+                while next_url and not _stop_event.is_set():
+                    try:
+                        resp = requests.get(next_url, headers=headers, timeout=REQUEST_TIMEOUT)
+                        resp.raise_for_status()
+                        page = resp.json()
+                        if output_file is not None and written_set is not None:
+                            flush_new_urls(
+                                extract_urls_from_results(page.get("data", [])),
+                                written_set, output_file, effective_lock, verbose
+                            )
+                        next_url = page.get("next")
+                    except Exception as e:
+                        print(f"[WARN] Failed to fetch paginated results for job {job_id}: {e}. Stopping pagination.")
+                        break
                 return
             elif status in ("failed", "cancelled"):
                 completed_normally = True
@@ -153,8 +178,11 @@ def collect_urls(base_url, target_url, output_file, api_key=None, verbose=False,
 
     if verbose:
         print(f"[INFO] Crawling {target_url}")
-    crawl_firecrawl(base_url, target_url, api_key, verbose,
-                    written_set=written_set, output_file=output_file, file_lock=effective_lock)
+    try:
+        crawl_firecrawl(base_url, target_url, api_key, verbose,
+                        written_set=written_set, output_file=output_file, file_lock=effective_lock)
+    except Exception as e:
+        print(f"[ERROR] Crawl failed for {target_url}: {e}")
 
     if verbose:
         print(f"[INFO] {len(written_set)} unique URLs scraped from {target_url}")
@@ -204,15 +232,15 @@ if __name__ == "__main__":
     )
     args = parser.parse_args()
 
-    signal.signal(signal.SIGINT, lambda sig, frame: _stop_event.set())
+    _stop_handler = lambda sig, frame: _stop_event.set()
+    signal.signal(signal.SIGINT, _stop_handler)
+    signal.signal(signal.SIGTERM, _stop_handler)
 
     base_url = args.server.rstrip("/")
 
     urls = []
-    output_file = None
     try:
         urls = [u.strip() for u in open(args.urls).readlines() if u.strip()]
-        output_file = open(args.output, "a")
     except Exception as e:
         print("[ERROR]", e)
         print(f"Usage: python {sys.argv[0]} -u /path/to/urls.txt -o output.txt -s http://localhost:3002")
@@ -230,20 +258,39 @@ if __name__ == "__main__":
         sys.exit(1)
     threads = args.threads
 
+    try:
+        output_file = open(args.output, "a")
+    except Exception as e:
+        print(f"[ERROR] Cannot open output file: {e}")
+        sys.exit(1)
+
     file_lock = threading.Lock()
 
     def process_url(url):
         try:
-            if args.verbose: print(f"[INFO] Verifying connectivity with {url}...")
-            requests.get(url, headers={"User-Agent":"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/147.0.0.0 Safari/537.36"}, timeout=20, verify=False)
+            if args.verbose:
+                print(f"[INFO] Verifying connectivity with {url}...")
+            requests.get(
+                url,
+                headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/147.0.0.0 Safari/537.36"},
+                timeout=20,
+                verify=False,
+            )
         except Exception as e:
-            if args.verbose: print(f"[ERROR] Unable to connect to {url}.", e, "Skipping...")
+            if args.verbose:
+                print(f"[ERROR] Unable to connect to {url}: {e}. Skipping...")
             return
-        collect_urls(base_url, url, output_file, args.api_key, args.verbose, file_lock)
+        try:
+            collect_urls(base_url, url, output_file, args.api_key, args.verbose, file_lock)
+        except Exception as e:
+            print(f"[ERROR] Unexpected error processing {url}: {e}")
 
-    with ThreadPoolExecutor(max_workers=threads) as executor:
-        futures = {executor.submit(process_url, u): u for u in urls}
-        for future in as_completed(futures):
-            exc = future.exception()
-            if exc and args.verbose:
-                print(f"[ERROR] Thread for {futures[future]} raised: {exc}")
+    try:
+        with ThreadPoolExecutor(max_workers=threads) as executor:
+            futures = {executor.submit(process_url, u): u for u in urls}
+            for future in as_completed(futures):
+                exc = future.exception()
+                if exc:
+                    print(f"[ERROR] Thread for {futures[future]} raised: {exc}")
+    finally:
+        output_file.close()
